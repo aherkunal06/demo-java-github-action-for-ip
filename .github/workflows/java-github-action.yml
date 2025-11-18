@@ -1,133 +1,70 @@
-name: Java CI/CD Pipeline To Tomcat (SSH)
+name: Java CI/CD to Tomcat Manager
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-env:
-  MAVEN_OPTS: "-Dmaven.repo.local=$HOME/.m2/repository"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     outputs:
-      war-path: ${{ steps.set-war.outputs.war }}
+      war: ${{ steps.getwar.outputs.war }}
 
     steps:
-      - name: Checkout code
+      # 1. Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Maven repository
+      # 2. Cache Maven
+      - name: Cache Maven Packages
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2-
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-
 
-      - name: Set up JDK 17
+      # 3. Setup Java
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
+      # 4. Build WAR
       - name: Build with Maven
-        run: mvn -B -V clean package -DskipTests
+        run: mvn clean package -DskipTests
 
+      # 5. Get WAR file path
       - name: Find WAR
-        id: set-war
+        id: getwar
         run: |
-          WAR_FILE=$(ls target/*.war 2>/dev/null | head -n1 || true)
-          if [ -z "$WAR_FILE" ]; then
-            echo "No WAR found in target/ - failing"
-            exit 1
-          fi
-          echo "war=$WAR_FILE" >> $GITHUB_OUTPUT
+          WAR=$(ls target/*.war | head -n 1)
+          echo "WAR found: $WAR"
+          echo "war=$WAR" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact to GitHub (optional)
+      # 6. Upload Artifact (optional)
+      - name: Upload WAR Artifact
         uses: actions/upload-artifact@v4
         with:
           name: myapp-war
-          path: ${{ steps.set-war.outputs.war }}
-
-      - name: Upload WAR to S3 (optional durable storage)
-        if: ${{ secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY }}
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-        run: |
-          aws s3 cp "${{ steps.set-war.outputs.war }}" s3://${{ secrets.S3_BUCKET }}/$(basename "${{ steps.set-war.outputs.war }}")
+          path: ${{ steps.getwar.outputs.war }}
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
-      - name: Download artifact
+      # 7. Download WAR built in previous job
+      - name: Download WAR
         uses: actions/download-artifact@v4
         with:
           name: myapp-war
-          path: ./artifact
 
-      - name: Prepare SSH key
+      # 8. Deploy to Tomcat Manager
+      - name: Deploy WAR using Tomcat Manager
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.TOMCAT_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          WAR_FILE=$(ls *.war)
+          echo "Deploying $WAR_FILE to Tomcat"
 
-      - name: Copy WAR to server (upload as timestamped file)
-        run: |
-          set -e
-          WAR_LOCAL=$(ls artifact/*.war | head -n1)
-          TIMESTAMP=$(date +%s)
-          TARGET_NAME="myapp-${TIMESTAMP}.war"
-          echo "Uploading ${WAR_LOCAL} -> /opt/tomcat/webapps/${TARGET_NAME}"
-          scp -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key "$WAR_LOCAL" "${{ secrets.TOMCAT_USER }}@${{ secrets.TOMCAT_HOST }}:/opt/tomcat/webapps/${TARGET_NAME}"
-        env:
-          TOMCAT_HOST: ${{ secrets.TOMCAT_HOST }}
-
-      - name: Swap WAR and restart Tomcat (atomic-ish)
-        run: |
-          set -e
-          TIMESTAMP=$(ls /dev/null) # dummy to keep template
-          # The script below runs on remote server via ssh:
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key "${{ secrets.TOMCAT_USER }}@${{ secrets.TOMCAT_HOST }}" bash -s <<'REMOTE'
-            set -e
-            cd /opt/tomcat/webapps
-
-            # find the most recent uploaded myapp-*.war (uploaded by this workflow)
-            NEW_WAR=$(ls -1t myapp-*.war 2>/dev/null | head -n1)
-            if [ -z "$NEW_WAR" ]; then
-              echo "No uploaded myapp-*.war found, abort."
-              exit 1
-            fi
-            echo "New WAR = $NEW_WAR"
-
-            # current deployed war (if exists)
-            if [ -f myapp.war ]; then
-              echo "Backing up current myapp.war -> myapp.war.bak.$(date +%s)"
-              mv myapp.war myapp.war.bak.$(date +%s)
-            fi
-
-            # move new war into place
-            mv "$NEW_WAR" myapp.war
-
-            # optional: remove old exploded folder to force fresh deployment
-            if [ -d myapp ]; then
-              rm -rf myapp
-            fi
-
-            # restart tomcat service (adjust service name if needed)
-            sudo systemctl restart tomcat
-
-            # wait a few seconds and check tomcat status
-            sleep 5
-            sudo systemctl is-active --quiet tomcat && echo "Tomcat restarted successfully" || (sudo journalctl -u tomcat -n 50 --no-pager; exit 1)
-          REMOTE
-        env:
-          TOMCAT_HOST: ${{ secrets.TOMCAT_HOST }}
+          curl -v -T "$WAR_FILE" \
+            "http://${{ secrets.TOMCAT_USER }}:${{ secrets.TOMCAT_PASSWORD }}@${{ secrets.TOMCAT_HOST }}/manager/text/deploy?path=/myapp&update=true"
