@@ -45,7 +45,7 @@ jobs:
 
     - name: Upload WAR to S3
       run: |
-        aws s3 cp target/myapp.war s3://my-java-artifacts-bucket/myapp.war
+        aws s3 cp target/myapp.war s3://my-java-artifacts-bucket-ak/myapp.war
 
     # -----------------------------------
     # 5. Deploy to Tomcat via SSH + SCP
